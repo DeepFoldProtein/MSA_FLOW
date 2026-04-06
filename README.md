@@ -86,7 +86,8 @@ LFM/                             # Latent Flow Matching reference (submodule)
 ## Installation
 
 ```bash
-git clone https://github.com/DeepFoldProtein/MSA_FLOW.git
+# 서브모듈 포함 clone
+git clone --recurse-submodules https://github.com/DeepFoldProtein/MSA_FLOW.git
 cd MSA_FLOW
 
 # uv로 가상환경 생성 및 의존성 설치
@@ -96,9 +97,15 @@ uv sync
 # pre-commit 훅 설정
 pre-commit install
 
-# Protenix (AF3 MSAModule)
+# 서브모듈 설치
 cd Protenix && pip install -e . && cd ..
+cd esm && pip install -e . && cd ..
 ```
+
+> 이미 clone한 경우 서브모듈 초기화:
+> ```bash
+> git submodule update --init --recursive
+> ```
 
 ---
 
