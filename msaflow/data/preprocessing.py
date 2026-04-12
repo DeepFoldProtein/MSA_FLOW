@@ -29,6 +29,9 @@ import os
 import sys
 import pickle
 import logging
+import time
+from collections import defaultdict
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -44,6 +47,105 @@ AA_TO_IDX = {aa: i for i, aa in enumerate(AA_LIST)}
 VOCAB_SIZE = len(AA_LIST)  # 22
 
 logger = logging.getLogger(__name__)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Preprocessing statistics tracker
+# ──────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class PreprocessStats:
+    """Accumulates per-entry statistics for end-of-run summary."""
+    n_total: int = 0
+    n_written: int = 0
+    skip_reasons: dict = field(default_factory=lambda: defaultdict(int))
+    seq_lens: list = field(default_factory=list)
+    msa_depths: list = field(default_factory=list)
+    neff_values: list = field(default_factory=list)
+    t_start: float = field(default_factory=time.time)
+
+    def skip(self, reason: str) -> None:
+        self.skip_reasons[reason] += 1
+
+    def record(self, seq_len: int, msa_depth: int, weights: np.ndarray) -> None:
+        self.n_written += 1
+        self.seq_lens.append(seq_len)
+        self.msa_depths.append(msa_depth)
+        self.neff_values.append(float(weights.sum()))
+
+    def eta_str(self, file_idx: int) -> str:
+        elapsed = time.time() - self.t_start
+        if file_idx == 0:
+            return "N/A"
+        rate = file_idx / elapsed          # files/sec
+        remaining = (self.n_total - file_idx) / max(rate, 1e-9)
+        m, s = divmod(int(remaining), 60)
+        h, m = divmod(m, 60)
+        return f"{h:02d}:{m:02d}:{s:02d}"
+
+    def log_progress(self, file_idx: int) -> None:
+        elapsed = time.time() - self.t_start
+        rate = file_idx / max(elapsed, 1e-9)
+        gpu_mem = ""
+        if torch.cuda.is_available():
+            alloc = torch.cuda.memory_allocated() / 1024**3
+            reserved = torch.cuda.memory_reserved() / 1024**3
+            gpu_mem = f"  GPU {alloc:.1f}/{reserved:.1f}GB"
+        logger.info(
+            "Progress  [%d/%d]  written=%d  skip=%d  "
+            "%.1f files/s  ETA=%s%s",
+            file_idx, self.n_total,
+            self.n_written,
+            sum(self.skip_reasons.values()),
+            rate,
+            self.eta_str(file_idx),
+            gpu_mem,
+        )
+
+    def log_summary(self) -> None:
+        elapsed = time.time() - self.t_start
+        n_skip = sum(self.skip_reasons.values())
+        logger.info("=" * 60)
+        logger.info("Preprocessing complete")
+        logger.info("  Total files     : %d", self.n_total)
+        logger.info("  Written         : %d  (%.1f%%)",
+                    self.n_written, 100 * self.n_written / max(self.n_total, 1))
+        logger.info("  Skipped         : %d", n_skip)
+        for reason, count in sorted(self.skip_reasons.items(),
+                                     key=lambda x: -x[1]):
+            logger.info("    %-30s : %d", reason, count)
+        logger.info("  Elapsed         : %.1f s", elapsed)
+        if self.seq_lens:
+            sl = np.array(self.seq_lens)
+            md = np.array(self.msa_depths)
+            neff = np.array(self.neff_values)
+            logger.info("  seq_len   mean=%.0f  med=%.0f  min=%d  max=%d",
+                        sl.mean(), np.median(sl), sl.min(), sl.max())
+            logger.info("  msa_depth mean=%.0f  med=%.0f  min=%d  max=%d",
+                        md.mean(), np.median(md), md.min(), md.max())
+            logger.info("  Neff      mean=%.1f  med=%.1f  min=%.1f  max=%.1f",
+                        neff.mean(), np.median(neff), neff.min(), neff.max())
+        logger.info("=" * 60)
+
+
+def _log_entry_shapes(key: str, entry: dict, verbose: bool) -> None:
+    """Log shapes of a single LMDB entry when verbose=True."""
+    if not verbose:
+        return
+    shapes = {
+        k: (v.shape if isinstance(v, np.ndarray) else
+            (v.shape if isinstance(v, torch.Tensor) else type(v).__name__))
+        for k, v in entry.items()
+    }
+    logger.debug(
+        "  [%s]  seq_len=%d  msa_depth=%d  "
+        "esm_emb=%s  msa_emb=%s",
+        key,
+        entry["seq_len"],
+        entry["msa_tokens"].shape[0],
+        shapes.get("esm_emb", "None"),
+        shapes.get("msa_emb", "None"),
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -96,20 +198,20 @@ def compute_sequence_weights(tokens: np.ndarray, threshold: float = 0.2) -> np.n
 
     This is the scheme used in the paper (Section 6.8.2):
         w_i = (1 + Σ_{j≠i} 1{d_hamming(x_i, x_j) < 0.2})^{-1}
+
+    Vectorised implementation: O(N²·L) via broadcasting — ~100× faster than
+    the naive Python double loop.
     """
-    N, L = tokens.shape
+    N, _ = tokens.shape
     if N == 1:
         return np.ones(1, dtype=np.float32)
-    weights = np.zeros(N, dtype=np.float32)
-    for i in range(N):
-        n_sim = 1  # count self
-        for j in range(N):
-            if j != i:
-                hamming = np.mean(tokens[i] != tokens[j])
-                if hamming < threshold:
-                    n_sim += 1
-        weights[i] = 1.0 / n_sim
-    return weights
+    # (N, N) pairwise fractional Hamming distances
+    # tokens: (N, L) int → broadcast diff → mean over L axis
+    diff = (tokens[:, None, :] != tokens[None, :, :])   # (N, N, L) bool
+    hamming = diff.mean(axis=-1)                         # (N, N) float
+    similar = hamming < threshold                        # (N, N) bool
+    counts = similar.sum(axis=1).astype(np.float32)      # includes self (hamming=0)
+    return 1.0 / counts.clip(min=1.0)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -248,6 +350,8 @@ def build_lmdb(
     max_seq_len: int = 1024,
     device: str = "cuda",
     map_size_gb: int = 500,
+    log_every: int = 100,
+    verbose: bool = False,
 ):
     """
     Process all A3M files in a3m_dir and write LMDB database.
@@ -260,32 +364,50 @@ def build_lmdb(
         max_seq_len:          Maximum sequence length.
         device:               Compute device string.
         map_size_gb:          LMDB map size in GB.
+        log_every:            Log progress every N files.
+        verbose:              Log per-entry shapes at DEBUG level.
     """
-    logger.info("build_lmdb started  ----- a3m_dir=%s  max_msa_seqs=%d  max_seq_len=%d",
-                a3m_dir, max_msa_seqs, max_seq_len)
+    logger.info("build_lmdb started")
+    logger.info("  a3m_dir    : %s", a3m_dir)
+    logger.info("  output     : %s", output_path)
+    logger.info("  max_seq_len: %d  max_msa_seqs: %d", max_seq_len, max_msa_seqs)
+    logger.info("  device     : %s  map_size: %dGB", device, map_size_gb)
+    logger.info("  protenix   : %s", protenix_checkpoint or "disabled")
+
     dev = torch.device(device if torch.cuda.is_available() else "cpu")
 
     # Load Protenix if checkpoint provided
     protenix_model = None
     if protenix_checkpoint is not None:
+        logger.info("Loading Protenix from %s ...", protenix_checkpoint)
         sys.path.insert(0, str(Path(__file__).parents[3] / "Protenix"))
         from protenix.model.protenix import Protenix
         from omegaconf import OmegaConf
         cfg = OmegaConf.load(Path(protenix_checkpoint).parent / "config.yaml")
         protenix_model = Protenix(cfg).eval().to(dev)
         state = torch.load(protenix_checkpoint, map_location=dev)
-        protenix_model.load_state_dict(state["model"], strict=False)
-        logger.info("Loaded Protenix from %s", protenix_checkpoint)
+        missing, unexpected = protenix_model.load_state_dict(state["model"], strict=False)
+        logger.info("Protenix loaded  (missing=%d  unexpected=%d)", len(missing), len(unexpected))
+        if missing:
+            logger.debug("Missing keys: %s", missing[:5])
 
     # Load ESM2-650M
+    logger.info("Loading ESM2-650M ...")
     sys.path.insert(0, str(Path(__file__).parents[3] / "esm"))
     import esm as esm_lib
     esm_model, alphabet = esm_lib.pretrained.esm2_t33_650M_UR50D()
     esm_model = esm_model.eval().to(dev)
-    logger.info("Loaded ESM2-650M")
+    if torch.cuda.is_available():
+        logger.info("ESM2 loaded  GPU mem: %.1f GB allocated",
+                    torch.cuda.memory_allocated() / 1024**3)
+    else:
+        logger.info("ESM2 loaded  (CPU mode)")
 
     a3m_files = list(Path(a3m_dir).glob("**/*.a3m"))
-    logger.info("Found %d A3M files", len(a3m_files))
+    logger.info("Found %d A3M files in %s", len(a3m_files), a3m_dir)
+    if not a3m_files:
+        logger.error("No .a3m files found — check a3m_dir path")
+        return
 
     env = lmdb.open(
         output_path,
@@ -295,59 +417,92 @@ def build_lmdb(
         map_async=True,
     )
 
-    n_written = 0
-    n_total = len(a3m_files)
-    milestone_interval = max(1, n_total // 10)  # log every ~10%
+    stats = PreprocessStats(n_total=len(a3m_files))
+
     for file_idx, a3m_path in enumerate(tqdm(a3m_files, desc="Building LMDB")):
         key = a3m_path.stem
         try:
+            # ── Parse ────────────────────────────────────────────────────────
             names, seqs = parse_a3m(str(a3m_path))
             if not seqs:
+                stats.skip("empty_file")
                 continue
+
+            n_seqs_raw = len(seqs)
             seqs = filter_msa(seqs)
             seqs = [s[:max_seq_len] for s in seqs]
             L = len(seqs[0])
-            if L == 0 or L > max_seq_len:
+
+            if L == 0:
+                stats.skip("zero_length")
+                continue
+            if L > max_seq_len:
+                stats.skip("seq_too_long")
                 continue
 
             query_seq = seqs[0].replace("-", "")
-            tokens = tokenise_msa(seqs[:max_msa_seqs])   # (N, L)
+            L_query = len(query_seq)
+            if L_query == 0:
+                stats.skip("query_all_gaps")
+                continue
+
+            seqs = [s[:L_query] for s in seqs]
+            tokens = tokenise_msa(seqs[:max_msa_seqs])   # (N, L_query)
             weights = compute_sequence_weights(tokens)    # (N,)
+            N = tokens.shape[0]
+
+            logger.debug(
+                "[%s] raw_seqs=%d  after_filter=%d  used=%d  L_aligned=%d  L_query=%d  Neff=%.1f",
+                key, n_seqs_raw, len(seqs), N, L, L_query, weights.sum(),
+            )
 
             entry = {
                 "msa_tokens": tokens,
                 "weights": weights,
                 "query_seq": query_seq,
-                "seq_len": L,
+                "seq_len": L_query,
                 "msa_emb": None,
                 "esm_emb": None,
             }
 
-            # ESM2 embedding for query
+            # ── ESM2 embedding ───────────────────────────────────────────────
             entry["esm_emb"] = extract_esm_embedding(
                 query_seq, esm_model, alphabet, dev
             ).half().numpy()
+            esm_shape = entry["esm_emb"].shape
+            if esm_shape[0] != L_query:
+                stats.skip("esm_length_mismatch")
+                logger.warning("[%s] ESM2 shape %s != L_query %d", key, esm_shape, L_query)
+                continue
 
-            # Protenix MSA embedding
+            # ── Protenix MSA embedding ───────────────────────────────────────
             if protenix_model is not None:
                 entry["msa_emb"] = extract_msa_embedding_protenix(
                     seqs[:max_msa_seqs], protenix_model, dev
                 ).half().numpy()
+                msa_shape = entry["msa_emb"].shape
+                if msa_shape[0] != L_query:
+                    stats.skip("msa_emb_length_mismatch")
+                    logger.warning("[%s] msa_emb shape %s != L_query %d", key, msa_shape, L_query)
+                    continue
 
+            # ── Write ────────────────────────────────────────────────────────
+            _log_entry_shapes(key, entry, verbose)
             with env.begin(write=True) as txn:
                 txn.put(key.encode(), pickle.dumps(entry))
-            n_written += 1
-
-            if n_written % milestone_interval == 0 or n_written % 100 == 0:
-                logger.info("Progress  ----- %d / %d files processed (%d written)",
-                            file_idx + 1, n_total, n_written)
+            stats.record(L_query, N, weights)
 
         except Exception as exc:
-            logger.warning("Skipped %s: %s", a3m_path.name, exc)
+            stats.skip(f"exception:{type(exc).__name__}")
+            logger.warning("Skipped %s  [%s] %s", a3m_path.name, type(exc).__name__, exc)
+            if verbose:
+                logger.debug("Traceback:", exc_info=True)
+
+        if (file_idx + 1) % log_every == 0:
+            stats.log_progress(file_idx + 1)
 
     env.close()
-    logger.info("build_lmdb complete  ----- %d / %d entries written to %s",
-                n_written, n_total, output_path)
+    stats.log_summary()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -370,7 +525,14 @@ if __name__ == "__main__":
     parser.add_argument("--max_seq_len",          type=int, default=1024)
     parser.add_argument("--device",               default="cuda")
     parser.add_argument("--map_size_gb",          type=int, default=500)
+    parser.add_argument("--log_every",            type=int, default=100,
+                        help="Log progress every N files")
+    parser.add_argument("--verbose",              action="store_true",
+                        help="Log per-entry shapes (sets log level to DEBUG)")
     args = parser.parse_args()
+
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
 
     build_lmdb(
         a3m_dir=args.a3m_dir,
@@ -380,4 +542,6 @@ if __name__ == "__main__":
         max_seq_len=args.max_seq_len,
         device=args.device,
         map_size_gb=args.map_size_gb,
+        log_every=args.log_every,
+        verbose=args.verbose,
     )

@@ -55,6 +55,7 @@ class MSADecoderDataset(Dataset):
             lock=False,
             readahead=False,
             meminit=False,
+            subdir=False,
         )
         self.n_seqs = n_seqs_per_msa
         self.max_len = max_seq_len
@@ -128,6 +129,7 @@ class LatentFMDataset(Dataset):
             lock=False,
             readahead=False,
             meminit=False,
+            subdir=False,
         )
         self.max_len = max_seq_len
 

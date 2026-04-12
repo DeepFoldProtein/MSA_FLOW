@@ -4,9 +4,9 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=16
-#SBATCH --mem=128G
+#SBATCH --mem=0
 #SBATCH --time=48:00:00
-#SBATCH --partition=gpu          # 클러스터에 맞게 수정
+#SBATCH --partition=normal
 #SBATCH --output=logs/preprocess_%j.out
 #SBATCH --error=logs/preprocess_%j.err
 
@@ -17,9 +17,9 @@ module load python/3.11.14
 export PATH="$HOME/.local/bin:$PATH"
 
 # ── 경로 설정 (환경에 맞게 수정) ──────────────────────────────────────────────
-REPO_DIR=${REPO_DIR:-$HOME/projects/MSA_FLOW}
-A3M_DIR=${A3M_DIR:-/store/database/openfold/uniclust30}
-OUTPUT_LMDB=${OUTPUT_LMDB:-/store/msaflow.lmdb}
+REPO_DIR=${REPO_DIR:-/home/paul3875/projects/MSA_FLOW}
+A3M_DIR=${A3M_DIR:-/gpfs/deepfold/users/yjlee4}
+OUTPUT_LMDB=${OUTPUT_LMDB:-/gpfs/deepfold/users/yjlee4/msaflow.lmdb}
 PROTENIX_CKPT=${PROTENIX_CKPT:-""}   # 없으면 ESM2만 추출
 
 # ── 환경 활성화 ────────────────────────────────────────────────────────────────

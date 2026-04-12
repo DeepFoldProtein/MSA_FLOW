@@ -4,9 +4,9 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:2
 #SBATCH --cpus-per-task=16
-#SBATCH --mem=128G
+#SBATCH --mem=0
 #SBATCH --time=48:00:00
-#SBATCH --partition=gpu          # 클러스터에 맞게 수정
+#SBATCH --partition=normal
 #SBATCH --output=logs/latent_fm_%j.out
 #SBATCH --error=logs/latent_fm_%j.err
 
@@ -17,8 +17,8 @@ module load python/3.11.14
 export PATH="$HOME/.local/bin:$PATH"
 
 # ── 경로 설정 (환경에 맞게 수정) ──────────────────────────────────────────────
-REPO_DIR=${REPO_DIR:-$HOME/projects/MSA_FLOW}
-LMDB_PATH=${LMDB_PATH:-/store/msaflow.lmdb}
+REPO_DIR=${REPO_DIR:-/home/paul3875/projects/MSA_FLOW}
+LMDB_PATH=${LMDB_PATH:-/gpfs/deepfold/users/yjlee4/msaflow.lmdb}
 OUTPUT_DIR=${OUTPUT_DIR:-$REPO_DIR/runs/latent_fm}
 CONFIG=$REPO_DIR/msaflow/configs/latent_fm.yaml
 ACCEL_CONFIG=$REPO_DIR/msaflow/configs/accelerate_2gpu.yaml
