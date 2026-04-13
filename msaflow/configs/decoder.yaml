@@ -14,7 +14,7 @@ data:
   lmdb_path: /data/msaflow.lmdb
   n_seqs_per_msa: 32      # Sequences sampled per MSA (paper: 32)
   max_seq_len: 1024
-  batch_size: 4           # Per-GPU batch (number of MSAs)
+  batch_size: 1           # Per-GPU batch (number of MSAs) — reduced from 4 to avoid OOM
   num_workers: 4
 
 training:

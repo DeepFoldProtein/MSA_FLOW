@@ -12,8 +12,10 @@ Two datasets are provided:
     One-to-one: query embedding → MSA embedding.
 """
 
+import json
 import pickle
 import random
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -65,17 +67,24 @@ class MSADecoderDataset(Dataset):
             all_keys = [k.decode() for k in txn.cursor().iternext(keys=True, values=False)]
 
         if require_msa_emb:
-            # Filter out entries without MSA embeddings
-            valid = []
+            # Sample a small subset to check if msa_emb exists.
+            # Full scan of 250k+ entries takes ~15 min — avoid it by spot-checking.
+            import random as _random
+            sample = _random.sample(all_keys, min(100, len(all_keys)))
+            missing = 0
             with self.env.begin() as txn:
-                for k in all_keys:
-                    val = txn.get(k.encode())
-                    entry = pickle.loads(val)
-                    if entry.get("msa_emb") is not None:
-                        valid.append(k)
-            self.keys = valid
-        else:
-            self.keys = all_keys
+                for k in sample:
+                    entry = pickle.loads(txn.get(k.encode()))
+                    if entry.get("msa_emb") is None:
+                        missing += 1
+            if missing > 0:
+                import logging as _logging
+                _logging.getLogger(__name__).warning(
+                    "%d/%d sampled entries missing msa_emb — "
+                    "set require_msa_emb=False or re-run preprocessing with Protenix",
+                    missing, len(sample),
+                )
+        self.keys = all_keys
 
     def __len__(self) -> int:
         return len(self.keys)
