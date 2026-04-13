@@ -123,7 +123,11 @@ def train(cfg):
     use_wandb = cfg.training.get("use_wandb", False)
     if accelerator.is_main_process and use_wandb:
         import wandb
-        wandb.init(project=cfg.training.wandb_project, config=OmegaConf.to_container(cfg))
+        wandb.init(
+            project=cfg.training.wandb_project,
+            name=cfg.training.get("wandb_run_name", None),
+            config=OmegaConf.to_container(cfg),
+        )
         wandb.watch(
             accelerator.unwrap_model(model),
             log="gradients",

@@ -31,5 +31,6 @@ training:
   ema_decay: 0.9999
   use_ema: true
   mixed_precision: "bf16"
-  use_wandb: false
+  use_wandb: true
   wandb_project: msaflow
+  wandb_run_name: decoder_d12_h768_lr1e5
