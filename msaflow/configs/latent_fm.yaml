@@ -11,7 +11,7 @@ model:
   max_seq_len: 1024
 
 data:
-  lmdb_path: /data/msaflow.lmdb
+  lmdb_path: /gpfs/deepfold/users/yjlee4/msaflow_merged.lmdb
   max_seq_len: 1024
   batch_size: 32          # Per-GPU; paper uses 32768 max total tokens
   num_workers: 4

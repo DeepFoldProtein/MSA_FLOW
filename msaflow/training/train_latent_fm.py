@@ -90,7 +90,8 @@ def train(cfg):
         weight_decay=cfg.training.weight_decay,
         betas=(0.9, 0.95),
     )
-    total_steps = len(loader) * cfg.training.epochs // cfg.training.grad_accumulation
+    # Divide by num_processes: same DDP fix as train_decoder.py
+    total_steps = (len(loader) // accelerator.num_processes) * cfg.training.epochs // cfg.training.grad_accumulation
     scheduler = get_lr_schedule(
         optimizer,
         warmup_steps=cfg.training.warmup_steps,
@@ -107,13 +108,20 @@ def train(cfg):
         ckpt = torch.load(ckpt_path, map_location="cpu")
         model.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
-        scheduler.load_state_dict(ckpt["scheduler"])
+        for pg in optimizer.param_groups:
+            pg["lr"] = cfg.training.lr
+        scheduler = get_lr_schedule(
+            optimizer,
+            warmup_steps=cfg.training.warmup_steps,
+            total_steps=total_steps,
+        )
         start_epoch = ckpt["epoch"] + 1
         global_step = ckpt["global_step"]
         if ema is not None and "ema" in ckpt:
             ema.load_state_dict(ckpt["ema"])
         if accelerator.is_main_process:
-            logger.info("Resumed from epoch %d, step %d", start_epoch, global_step)
+            logger.info("Resumed from epoch %d, step %d  (LR reset to %.2e)",
+                        start_epoch, global_step, cfg.training.lr)
 
     # ── Prepare ───────────────────────────────────────────────────────────────
     model, optimizer, loader, scheduler = accelerator.prepare(
@@ -142,6 +150,7 @@ def train(cfg):
         model.train()
         epoch_loss = 0.0
 
+        grad_norm = 0.0
         for batch_idx, batch in enumerate(loader):
             with accelerator.accumulate(model):
                 z1      = batch["msa_emb"]   # (B, L, 128)
