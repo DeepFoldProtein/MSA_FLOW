@@ -5,7 +5,7 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=64G
+#SBATCH --mem=0
 #SBATCH --time=4:00:00
 #SBATCH --partition=normal
 #SBATCH --output=logs/qeval_%j.out
