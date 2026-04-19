@@ -3,8 +3,8 @@
 #SBATCH --nodes=1
 #SBATCH --nodelist=ada-004
 #SBATCH --ntasks-per-node=1
-#SBATCH --gres=gpu:2
-#SBATCH --cpus-per-task=16
+#SBATCH --gres=gpu:4
+#SBATCH --cpus-per-task=32
 #SBATCH --mem=0
 #SBATCH --time=24:00:00
 #SBATCH --partition=normal
@@ -22,7 +22,7 @@ REPO_DIR=${REPO_DIR:-/home/paul3875/projects/MSA_FLOW}
 LMDB_PATH=${LMDB_PATH:-/gpfs/deepfold/users/yjlee4/msaflow_merged.lmdb}
 OUTPUT_DIR=${OUTPUT_DIR:-$REPO_DIR/runs/decoder}
 CONFIG=$REPO_DIR/msaflow/configs/decoder.yaml
-ACCEL_CONFIG=$REPO_DIR/msaflow/configs/accelerate_2gpu.yaml
+ACCEL_CONFIG=$REPO_DIR/msaflow/configs/accelerate_4gpu.yaml
 
 # ── 환경 활성화 ────────────────────────────────────────────────────────────────
 source $REPO_DIR/.venv/bin/activate
