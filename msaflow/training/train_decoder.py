@@ -214,6 +214,18 @@ def train(cfg):
     )
     if accelerator.is_main_process:
         logger.info("Dataset loaded  ----- %d entries", len(dataset))
+
+    # Overfit / sanity-check mode: restrict to a tiny fixed subset.
+    # If the model cannot overfit N=16 MSAs after 500 epochs, the training
+    # pipeline has a fundamental bug (wrong loss sign, bad normalisation, etc.).
+    n_debug = cfg.data.get("n_debug_samples", None)
+    if n_debug is not None:
+        from torch.utils.data import Subset
+        n_debug = min(int(n_debug), len(dataset))
+        dataset = Subset(dataset, list(range(n_debug)))
+        if accelerator.is_main_process:
+            logger.info("OVERFIT DEBUG: dataset clamped to %d samples", n_debug)
+
     loader = DataLoader(
         dataset,
         batch_size=cfg.data.batch_size,
@@ -294,7 +306,9 @@ def train(cfg):
     val_every = cfg.training.get("val_every", 0)   # 0 = no validation
     val_item = None
     if val_every > 0 and accelerator.is_main_process:
-        val_item = dataset[0]   # fixed entry: msa_emb (L,128), tokens (n_seqs,L)
+        # dataset may be a Subset — use .dataset[0] if so
+        raw = dataset.dataset[0] if hasattr(dataset, "dataset") else dataset[0]
+        val_item = raw  # fixed entry: msa_emb (L,128), tokens (n_seqs,L)
 
     # ── Training loop ─────────────────────────────────────────────────────────
     if accelerator.is_main_process:

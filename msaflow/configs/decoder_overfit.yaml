@@ -1,0 +1,58 @@
+# MSAFlow SFM Decoder — overfit / sanity-check config
+#
+# Goal: verify the training pipeline is correct by overfitting a tiny
+# fixed set of MSAs.  A working pipeline should drive training loss
+# toward ~0 within a few hundred epochs.  If it can't overfit 16 samples,
+# there is a fundamental bug (wrong loss direction, bad normalisation, etc.)
+#
+# Usage:
+#   accelerate launch msaflow/training/train_decoder.py \
+#       --config msaflow/configs/decoder_overfit.yaml \
+#       --lmdb_path /gpfs/deepfold/users/yjlee4/msaflow_merged.lmdb \
+#       --output_dir /runs/decoder_overfit
+
+model:
+  vocab_size: 22
+  msa_dim: 128
+  hidden_size: 768        # same architecture as production run
+  depth: 12
+  num_heads: 12
+  mlp_ratio: 4.0
+  max_seq_len: 1024
+
+data:
+  lmdb_path: /gpfs/deepfold/users/yjlee4/msaflow_merged.lmdb
+  n_seqs_per_msa: 32
+  max_seq_len: 1024
+  batch_size: 1
+  num_workers: 0          # 0 for reproducibility / easier debugging
+  n_debug_samples: 16     # ← KEY: only 16 MSAs, same every epoch
+
+training:
+  epochs: 500             # many epochs — must overfit small data
+  lr: 1.0e-4              # 10× higher LR to reach overfit faster
+  weight_decay: 0.0       # no regularisation — we WANT overfit
+  warmup_steps: 100
+  max_grad_norm: 10.0
+  grad_accumulation: 1    # no accumulation — see every gradient
+  seed: 42
+  output_dir: /runs/decoder_overfit
+  resume: false
+  log_every: 10           # frequent logging to watch loss curve
+  ema_decay: 0.9999
+  use_ema: false          # skip EMA overhead during debug
+  mixed_precision: "bf16"
+  use_wandb: true
+  wandb_project: msaflow
+  wandb_run_name: decoder_overfit_16samples_v4
+  val_every: 50           # validate every 50 epochs (500 total → 10 checkpoints)
+  val_ode_steps: 100
+  t_max_eps: 0.01
+
+# Expected behaviour:
+#   epoch ~50  : loss < 0.5   (model starts learning vocabulary)
+#   epoch ~200 : loss < 0.1   (most positions predicted correctly)
+#   epoch ~500 : loss < 0.01  (near-perfect overfit)
+#   val/seq_recovery > 0.8 at convergence
+#
+# If loss plateaus above 0.3 → investigate gradient flow / loss computation
