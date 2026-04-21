@@ -18,7 +18,7 @@ data:
   num_workers: 4
 
 training:
-  epochs: 7
+  epochs: 21              # extended from 7: resume from epoch 7 checkpoint
   lr: 1.0e-5
   weight_decay: 0.1
   warmup_steps: 5000
@@ -26,7 +26,7 @@ training:
   grad_accumulation: 4
   seed: 42
   output_dir: /runs/decoder
-  resume: false           # architecture changed (msa_norm added) — must restart
+  resume: true            # resume from latest.pt
   log_every: 100
   ema_decay: 0.9999
   use_ema: true

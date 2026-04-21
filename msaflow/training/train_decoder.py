@@ -134,6 +134,7 @@ def get_lr_schedule(
     warmup_steps: int,
     total_steps: int,
     min_lr_ratio: float = 0.01,
+    last_epoch: int = -1,
 ):
     def _lr_lambda(step: int) -> float:
         if step < warmup_steps:
@@ -141,7 +142,7 @@ def get_lr_schedule(
         progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
         cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
         return max(min_lr_ratio, cosine)
-    return LambdaLR(optimizer, _lr_lambda)
+    return LambdaLR(optimizer, _lr_lambda, last_epoch=last_epoch)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -265,12 +266,14 @@ def train(cfg):
         # Reset optimizer LR to cfg value — load_state_dict restores the old (near-zero) LR.
         for pg in optimizer.param_groups:
             pg["lr"] = cfg.training.lr
-        scheduler.load_state_dict(ckpt["scheduler"])
-        # Reset scheduler: rebuild from scratch so warmup starts fresh.
+        # Rebuild scheduler with the (possibly extended) total_steps.
+        # Pass last_epoch=global_step so LambdaLR resumes at the correct
+        # position on the cosine curve without a slow for-loop fast-forward.
         scheduler = get_lr_schedule(
             optimizer,
             warmup_steps=cfg.training.warmup_steps,
             total_steps=total_steps,
+            last_epoch=ckpt["global_step"],
         )
         start_epoch = ckpt["epoch"] + 1
         global_step = ckpt["global_step"]
