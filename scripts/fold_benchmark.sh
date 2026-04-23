@@ -34,7 +34,7 @@ REF_PDB_DIR=${REF_PDB_DIR:-}          # leave empty if no reference PDBs
 TMSCORE_BIN=${TMSCORE_BIN:-TMscore}   # set to full path if not in $PATH
 
 N_SEQS=${N_SEQS:-32}       # sequences per seed (paper: 32)
-N_SEEDS=${N_SEEDS:-10}     # latent FM seeds — each folded separately, best pLDDT reported
+N_SEEDS=${N_SEEDS:-5}      # latent FM seeds — each folded separately, best pLDDT reported
 N_STEPS=${N_STEPS:-100}    # ODE steps
 TEMPERATURE=${TEMPERATURE:-0.5}   # SDE temperature (paper: 0.5)
 
