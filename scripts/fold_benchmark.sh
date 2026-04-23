@@ -11,19 +11,12 @@
 #SBATCH --output=logs/bench_%j.out
 #SBATCH --error=logs/bench_%j.err
 
-# ── Python 모듈 로드 ───────────────────────────────────────────────────────────
+# ── Python / CUDA 모듈 로드 ────────────────────────────────────────────────────
 module load python/3.11.14
+module load cuda/13.0.2   # PyTorch CUDA 버전과 일치 (torch.version.cuda == 13.0)
 
 # ── CUDA_HOME 설정 (Protenix fast_layer_norm JIT 컴파일에 필요) ────────────────
-if [ -z "$CUDA_HOME" ]; then
-    # nvcc 위치로 자동 감지
-    NVCC_PATH=$(which nvcc 2>/dev/null)
-    if [ -n "$NVCC_PATH" ]; then
-        export CUDA_HOME=$(dirname $(dirname $NVCC_PATH))
-    else
-        export CUDA_HOME=/usr/local/cuda
-    fi
-fi
+export CUDA_HOME=${CUDA_HOME:-$(dirname $(dirname $(which nvcc)))}
 export LD_LIBRARY_PATH=$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}
 echo "CUDA_HOME      : $CUDA_HOME"
 
@@ -36,13 +29,14 @@ DECODER_CKPT=${DECODER_CKPT:-$REPO_DIR/runs/decoder/decoder_ema_final.pt}
 LATENT_FM_CKPT=${LATENT_FM_CKPT:-$REPO_DIR/runs/latent_fm/latent_fm_ema_final.pt}
 FASTA=${FASTA:-$REPO_DIR/data/foldbench_monomer.fasta}
 OUTPUT_DIR=${OUTPUT_DIR:-$REPO_DIR/runs/fold_benchmark}
+BASELINE_DIR=${BASELINE_DIR:-$REPO_DIR/runs/fold_benchmark_nomsa}
 REF_PDB_DIR=${REF_PDB_DIR:-}          # leave empty if no reference PDBs
 TMSCORE_BIN=${TMSCORE_BIN:-TMscore}   # set to full path if not in $PATH
 
 N_SEQS=${N_SEQS:-32}       # sequences per seed (paper: 32)
-N_SEEDS=${N_SEEDS:-10}     # latent FM seeds
+N_SEEDS=${N_SEEDS:-10}     # latent FM seeds — each folded separately, best pLDDT reported
 N_STEPS=${N_STEPS:-100}    # ODE steps
-TEMPERATURE=${TEMPERATURE:-0.0}
+TEMPERATURE=${TEMPERATURE:-0.5}   # SDE temperature (paper: 0.5)
 
 PROTENIX_MODEL=${PROTENIX_MODEL:-protenix_base_default_v1.0.0}
 # Protenix looks for checkpoints under $PROTENIX_ROOT_DIR/checkpoint/
@@ -59,7 +53,7 @@ source $REPO_DIR/.venv/bin/activate
 export PYTHONPATH=$REPO_DIR/Protenix:$PYTHONPATH
 
 # ── 로그 디렉터리 ──────────────────────────────────────────────────────────────
-mkdir -p $OUTPUT_DIR $REPO_DIR/logs
+mkdir -p $OUTPUT_DIR $BASELINE_DIR $REPO_DIR/logs
 
 echo "Job ID        : $SLURM_JOB_ID"
 echo "Node          : $SLURMD_NODENAME"
@@ -69,17 +63,21 @@ echo "Decoder ckpt  : $DECODER_CKPT"
 echo "Latent FM ckpt: $LATENT_FM_CKPT"
 echo "FASTA         : $FASTA"
 echo "Output dir    : $OUTPUT_DIR"
+echo "Baseline dir  : $BASELINE_DIR"
 echo "Protenix model: $PROTENIX_MODEL"
+echo "n_seeds       : $N_SEEDS (each seed folded separately, best pLDDT reported)"
 date
 
-# ── 벤치마크 실행 (4 GPU 병렬) ────────────────────────────────────────────────
+NUM_SHARDS=4
+
 REF_ARG=""
 if [ -n "$REF_PDB_DIR" ]; then
     REF_ARG="--ref_pdb_dir $REF_PDB_DIR"
 fi
 
-NUM_SHARDS=4
-
+# ── MSAFlow zero-shot (Section 4.2 protocol) ──────────────────────────────────
+# Each seed generates 32 sequences → fold with Protenix → report best pLDDT.
+echo "=== Launching MSAFlow zero-shot shards ==="
 for SHARD_ID in 0 1 2 3; do
     CUDA_VISIBLE_DEVICES=$SHARD_ID \
     python $REPO_DIR/msaflow/inference/fold_benchmark.py \
@@ -87,6 +85,7 @@ for SHARD_ID in 0 1 2 3; do
         --decoder_ckpt   $DECODER_CKPT \
         --latent_fm_ckpt $LATENT_FM_CKPT \
         --output_dir     $OUTPUT_DIR \
+        --mode           zeroshot \
         --device         cuda \
         --n_seqs         $N_SEQS \
         --n_seeds        $N_SEEDS \
@@ -100,28 +99,57 @@ for SHARD_ID in 0 1 2 3; do
         > $OUTPUT_DIR/shard_${SHARD_ID}.log 2>&1 &
 done
 
-echo "Launched 4 shards (PIDs: $(jobs -p))"
+echo "Launched MSAFlow zero-shot shards (PIDs: $(jobs -p))"
 wait
-echo "All shards done: $(date)"
+echo "MSAFlow zero-shot done: $(date)"
+
+# ── No-MSA baseline ────────────────────────────────────────────────────────────
+echo "=== Launching No-MSA baseline shards ==="
+for SHARD_ID in 0 1 2 3; do
+    CUDA_VISIBLE_DEVICES=$SHARD_ID \
+    python $REPO_DIR/msaflow/inference/fold_benchmark.py \
+        --fasta          $FASTA \
+        --decoder_ckpt   $DECODER_CKPT \
+        --latent_fm_ckpt $LATENT_FM_CKPT \
+        --output_dir     $BASELINE_DIR \
+        --mode           nomsa \
+        --device         cuda \
+        --protenix_model $PROTENIX_MODEL \
+        --tmscore_bin    $TMSCORE_BIN \
+        --shard_id       $SHARD_ID \
+        --num_shards     $NUM_SHARDS \
+        $REF_ARG \
+        > $BASELINE_DIR/shard_${SHARD_ID}.log 2>&1 &
+done
+
+echo "Launched No-MSA baseline shards (PIDs: $(jobs -p))"
+wait
+echo "No-MSA baseline done: $(date)"
 
 # ── 결과 병합 ──────────────────────────────────────────────────────────────────
 python - << 'PYEOF'
 import csv, glob, os
 
-output_dir = os.environ.get("OUTPUT_DIR", "runs/fold_benchmark")
-rows, header = [], None
-for shard_csv in sorted(glob.glob(f"{output_dir}/shard_*.csv")):
-    with open(shard_csv) as fh:
-        reader = csv.DictReader(fh)
-        if header is None:
-            header = reader.fieldnames
-        rows.extend(reader)
+def merge_shards(output_dir, label):
+    rows, header = [], None
+    for shard_csv in sorted(glob.glob(f"{output_dir}/shard_*.csv")):
+        with open(shard_csv) as fh:
+            reader = csv.DictReader(fh)
+            if header is None:
+                header = reader.fieldnames
+            rows.extend(reader)
+    if rows:
+        out_path = f"{output_dir}/benchmark_results.csv"
+        with open(out_path, "w", newline="") as fh:
+            writer = csv.DictWriter(fh, fieldnames=header)
+            writer.writeheader()
+            writer.writerows(rows)
+        print(f"[{label}] Merged {len(rows)} rows → {out_path}")
+    else:
+        print(f"[{label}] No shard CSVs found in {output_dir}")
 
-if rows:
-    out_path = f"{output_dir}/benchmark_results.csv"
-    with open(out_path, "w", newline="") as fh:
-        writer = csv.DictWriter(fh, fieldnames=header)
-        writer.writeheader()
-        writer.writerows(rows)
-    print(f"Merged {len(rows)} rows → {out_path}")
+merge_shards(os.environ.get("OUTPUT_DIR",  "runs/fold_benchmark"),       "MSAFlow zero-shot")
+merge_shards(os.environ.get("BASELINE_DIR","runs/fold_benchmark_nomsa"), "No-MSA baseline")
 PYEOF
+
+echo "All done: $(date)"

@@ -355,6 +355,49 @@ def generate_zeroshot(
     return best_seqs
 
 
+@torch.no_grad()
+def generate_zeroshot_seeds(
+    query_seq: str,
+    decoder: SFMDecoder,
+    latent_fm: LatentFMEncoder,
+    esm_model,
+    alphabet,
+    n_seeds: int = 10,
+    n_seqs_per_seed: int = 32,
+    n_steps: int = 100,
+    temperature: float = 0.5,
+    device: torch.device = None,
+):
+    """
+    Zero-shot MSA generation — yield (seed_idx, seqs) for each seed independently.
+
+    This is the evaluation protocol from Section 4.2: fold each seed's sequences
+    separately with Protenix and report the best pLDDT across seeds.
+
+    Yields:
+        (seed_idx: int, seqs: list[str])  — one tuple per seed
+    """
+    if device is None:
+        device = next(decoder.parameters()).device
+
+    logger.info("generate_zeroshot_seeds  ----- query L=%d  n_seeds=%d  n_seqs/seed=%d",
+                len(query_seq), n_seeds, n_seqs_per_seed)
+    esm_emb = extract_esm_embedding(query_seq, esm_model, alphabet, device)   # (L, 1280)
+    esm_emb_batch = esm_emb.unsqueeze(0).to(device)                           # (1, L, 1280)
+
+    for seed in range(n_seeds):
+        logger.info("Seed %d / %d  -----", seed + 1, n_seeds)
+        torch.manual_seed(seed)
+        z_syn = sample_msa_embeddings(
+            latent_fm, esm_emb_batch, n_steps=n_steps, temperature=temperature
+        )  # (1, L, 128)
+        seqs = decode_from_embedding(
+            decoder, z_syn[0].cpu(), n_seqs=n_seqs_per_seed, n_steps=n_steps,
+            temperature=temperature, device=device
+        )
+        yield seed, seqs
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Diversity helpers
 # ──────────────────────────────────────────────────────────────────────────────

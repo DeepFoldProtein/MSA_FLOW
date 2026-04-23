@@ -1,33 +1,58 @@
 """
 MSAFlow Fold Benchmark — pLDDT / TM-score evaluation.
 
-Pipeline (mirrors paper Section 4.1 / Table 1 evaluation):
-  1. Read CAMEO test proteins (FASTA, one sequence per line).
-  2. Generate 32 MSA sequences per protein in zero-shot mode
-     (Latent FM → SFM Decoder) and write them as A3M files.
+Pipeline (mirrors paper Section 4.1 / Table 2 evaluation):
+  1. Read test proteins (FASTA, one sequence per entry).
+  2. Generate MSA sequences via one of three modes:
+
+       zeroshot  — 10 seeds × 32 seqs each (Section 4.2 protocol):
+                   fold each seed's MSA separately with Protenix, report best pLDDT.
+
+       fewshot   — Syn+Rec augmentation of a shallow MSA (Section 4.2):
+                   requires --shallow_msa_dir and optionally --protenix_ckpt.
+                   Folds the combined augmented MSA once.
+
+       nomsa     — Baseline: skip MSA generation, fold with sequence only.
+
   3. Build Protenix JSON inputs pointing to the generated A3M.
-  4. Run `protenix pred` for each protein.
+  4. Run `protenix pred` for each protein (/ seed).
   5. Extract pLDDT from the output CIF/PDB.
   6. Optionally compute TM-score vs reference PDB using TMscore binary.
   7. Write summary CSV and print aggregate statistics.
 
-Usage:
+Usage (zero-shot):
     python msaflow/inference/fold_benchmark.py \\
-        --fasta        data/cameo_test.fasta \\
-        --decoder_ckpt runs/decoder/decoder_ema_final.pt \\
+        --fasta          data/foldbench_monomer.fasta \\
+        --decoder_ckpt   runs/decoder/decoder_ema_final.pt \\
         --latent_fm_ckpt runs/latent_fm/latent_fm_ema_final.pt \\
-        --output_dir   runs/fold_benchmark \\
-        [--ref_pdb_dir data/cameo_reference_pdbs/] \\
-        [--device cuda] \\
-        [--n_seqs 32] \\
-        [--n_steps 100] \\
-        [--protenix_model protenix_base_default_v1.0.0]
+        --output_dir     runs/fold_benchmark \\
+        --mode           zeroshot \\
+        [--ref_pdb_dir   data/reference_pdbs/] \\
+        [--device cuda]  [--n_seeds 10] [--n_seqs 32] [--n_steps 100]
+
+Usage (no-MSA baseline):
+    python msaflow/inference/fold_benchmark.py \\
+        --fasta          data/foldbench_monomer.fasta \\
+        --decoder_ckpt   dummy  --latent_fm_ckpt dummy \\
+        --output_dir     runs/fold_benchmark_nomsa \\
+        --mode           nomsa
+
+Usage (few-shot):
+    python msaflow/inference/fold_benchmark.py \\
+        --fasta          data/foldbench_monomer.fasta \\
+        --decoder_ckpt   runs/decoder/decoder_ema_final.pt \\
+        --latent_fm_ckpt runs/latent_fm/latent_fm_ema_final.pt \\
+        --output_dir     runs/fold_benchmark_fewshot \\
+        --mode           fewshot \\
+        --shallow_msa_dir data/shallow_msas/ \\
+        [--protenix_ckpt  runs/protenix/protenix_base.pt]
 """
 
 import argparse
 import csv
 import json
 import logging
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -62,6 +87,24 @@ def parse_fasta(path: str) -> list[tuple[str, str]]:
     return results
 
 
+def parse_a3m_seqs(path: str) -> list[str]:
+    """Read sequences from an A3M file (first entry = query, rest = hits)."""
+    seqs = []
+    buf = []
+    with open(path) as fh:
+        for line in fh:
+            line = line.rstrip()
+            if line.startswith(">"):
+                if buf:
+                    seqs.append("".join(buf))
+                buf = []
+            elif line:
+                buf.append(line.upper())
+    if buf:
+        seqs.append("".join(buf))
+    return seqs
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Protenix input JSON builder
 # ─────────────────────────────────────────────────────────────────────────────
@@ -75,8 +118,7 @@ def build_protenix_json(
     Build a single Protenix prediction task dict.
 
     Uses `unpairedMsaPath` for the generated A3M (new Protenix format).
-    If no MSA path is provided, Protenix will either run its own MSA search
-    or fold with no MSA (depending on server setup).
+    If no MSA path is provided, Protenix will fold with sequence only.
     """
     protein_chain: dict = {"sequence": query_seq, "count": 1}
     if msa_a3m_path is not None:
@@ -99,6 +141,7 @@ def run_protenix(
     output_dir: str,
     model_name: str = "protenix_base_default_v1.0.0",
     protenix_dir: Optional[str] = None,
+    use_msa: bool = True,
 ) -> subprocess.CompletedProcess:
     """Invoke `protenix pred` as a subprocess.
 
@@ -106,8 +149,6 @@ def run_protenix(
     local esm/ submodule does not shadow the installed fair-esm package and
     cause "AttributeError: module 'esm' has no attribute 'data'".
     """
-    import os
-
     cmd = [
         "protenix", "pred",
         "-i", input_json,
@@ -119,6 +160,7 @@ def run_protenix(
         "--enable_fusion",  "False",
         "--trimul_kernel",  "torch",
         "--triatt_kernel",  "torch",
+        "--use_msa",        str(use_msa),
     ]
 
     # Repo root = two levels above this file (msaflow/inference/fold_benchmark.py)
@@ -156,7 +198,7 @@ def extract_plddt_from_cif(cif_path: str) -> float:
     Parse mean pLDDT from a Protenix output CIF file.
 
     Protenix writes per-residue B-factor as pLDDT (scaled 0–100).
-    We average across all protein residues.
+    We average across all protein CA atoms.
     """
     plddt_values = []
     with open(cif_path) as fh:
@@ -170,7 +212,6 @@ def extract_plddt_from_cif(cif_path: str) -> float:
                 in_atom_site = True
                 continue
             if in_atom_site and line.startswith("_"):
-                # New block: stop parsing atom_site
                 in_atom_site = False
                 col_idx = {}
                 continue
@@ -178,7 +219,6 @@ def extract_plddt_from_cif(cif_path: str) -> float:
                 parts = line.split()
                 if len(parts) <= max(col_idx.values(), default=-1):
                     continue
-                # Extract B_iso_or_equiv (= pLDDT) and group_PDB (ATOM/HETATM)
                 group = parts[col_idx["group_PDB"]] if "group_PDB" in col_idx else "ATOM"
                 atom_name = parts[col_idx["label_atom_id"]] if "label_atom_id" in col_idx else "CA"
                 b_val = parts[col_idx["B_iso_or_equiv"]] if "B_iso_or_equiv" in col_idx else None
@@ -195,14 +235,12 @@ def extract_plddt_from_cif(cif_path: str) -> float:
 
 
 def find_protenix_output_cif(output_dir: str, name: str) -> Optional[str]:
-    """Find the Protenix output CIF/PDB file for a given prediction name."""
+    """Find the Protenix output CIF file for a given prediction name."""
     base = Path(output_dir)
-    # Protenix writes to: {output_dir}/{name}/{name}_*.cif (or .pdb)
     for ext in ("*.cif", "*.pdb"):
         matches = list(base.rglob(f"{name}*{ext[1:]}"))
         if matches:
             return str(matches[0])
-    # Fallback: any CIF in the output directory
     matches = sorted(base.rglob("*.cif"))
     return str(matches[0]) if matches else None
 
@@ -216,11 +254,7 @@ def compute_tmscore(
     ref_pdb: str,
     tmscore_bin: str = "TMscore",
 ) -> tuple[float, float]:
-    """
-    Run TMscore binary and return (TM-score, RMSD).
-
-    Returns (nan, nan) if binary not found or parse fails.
-    """
+    """Run TMscore binary and return (TM-score, RMSD)."""
     try:
         result = subprocess.run(
             [tmscore_bin, pred_pdb, ref_pdb],
@@ -245,6 +279,63 @@ def compute_tmscore(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Per-protein folding helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def fold_once(
+    prot_name: str,
+    query_seq: str,
+    a3m_path: Optional[Path],
+    fold_dir: Path,
+    args,
+    use_msa: bool = True,
+    tag: str = "",
+) -> tuple[float, Optional[str]]:
+    """
+    Build Protenix input, run Protenix, extract pLDDT.
+
+    Returns (plddt, cif_path_or_None).
+    """
+    run_name = f"{prot_name}{tag}"
+    run_dir = fold_dir / run_name
+    run_dir.mkdir(exist_ok=True)
+
+    task = build_protenix_json(
+        name=run_name,
+        query_seq=query_seq,
+        msa_a3m_path=str(a3m_path) if (a3m_path is not None and a3m_path.exists()) else None,
+    )
+    json_path = run_dir / f"{run_name}_input.json"
+    with open(json_path, "w") as fh:
+        json.dump([task], fh, indent=2)
+
+    protenix_out_dir = run_dir / "protenix_out"
+    protenix_out_dir.mkdir(exist_ok=True)
+
+    pred_cif = find_protenix_output_cif(str(protenix_out_dir), run_name)
+    if pred_cif and not args.refold:
+        logger.info("  Protenix output exists, skipping: %s", pred_cif)
+        return extract_plddt_from_cif(pred_cif), pred_cif
+
+    result = run_protenix(
+        input_json=str(json_path),
+        output_dir=str(protenix_out_dir),
+        model_name=args.protenix_model,
+        use_msa=use_msa,
+    )
+    if result.returncode != 0:
+        logger.error("  Protenix failed (exit %d) for %s", result.returncode, run_name)
+        return float("nan"), None
+
+    pred_cif = find_protenix_output_cif(str(protenix_out_dir), run_name)
+    if pred_cif is None:
+        logger.error("  CIF not found for %s", run_name)
+        return float("nan"), None
+
+    return extract_plddt_from_cif(pred_cif), pred_cif
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main benchmark loop
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -255,6 +346,11 @@ def run_benchmark(args):
         datefmt="%Y-%m-%d %H:%M",
     )
 
+    # Resolve mode (--no_msa is a deprecated alias for --mode nomsa)
+    mode = args.mode
+    if args.no_msa:
+        mode = "nomsa"
+
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -264,19 +360,33 @@ def run_benchmark(args):
     msa_dir.mkdir(exist_ok=True)
     fold_dir.mkdir(exist_ok=True)
 
-    # ── Load models ────────────────────────────────────────────────────────────
-    logger.info("Loading SFM decoder from %s", args.decoder_ckpt)
-    sys.path.insert(0, str(Path(__file__).parents[2]))
-    from msaflow.inference.generate import (
-        load_sfm_decoder, load_latent_fm, load_esm2,
-        generate_zeroshot, write_a3m,
-    )
+    # ── Load models (skip in nomsa baseline mode) ──────────────────────────────
+    if mode != "nomsa":
+        logger.info("Loading SFM decoder from %s", args.decoder_ckpt)
+        sys.path.insert(0, str(Path(__file__).parents[2]))
+        from msaflow.inference.generate import (
+            load_sfm_decoder, load_latent_fm, load_esm2, load_protenix,
+            generate_zeroshot_seeds, augment_shallow, write_a3m,
+        )
+        decoder = load_sfm_decoder(args.decoder_ckpt, device)
+        latent_fm = load_latent_fm(args.latent_fm_ckpt, device)
+        logger.info("Loading ESM2-650M ...")
+        esm_model, alphabet = load_esm2(device)
 
-    decoder = load_sfm_decoder(args.decoder_ckpt, device)
-    latent_fm = load_latent_fm(args.latent_fm_ckpt, device)
-    logger.info("Loading ESM2-650M ...")
-    esm_model, alphabet = load_esm2(device)
-    logger.info("All models loaded.")
+        protenix_model = None
+        if mode == "fewshot" and args.protenix_ckpt:
+            logger.info("Loading Protenix for Rec track from %s", args.protenix_ckpt)
+            protenix_model = load_protenix(args.protenix_ckpt, device)
+            logger.info("Protenix loaded for Rec track.")
+        elif mode == "fewshot":
+            logger.warning(
+                "--protenix_ckpt not provided; few-shot will run Syn track only "
+                "(no Rec track from shallow MSA embedding)."
+            )
+
+        logger.info("All models loaded.")
+    else:
+        logger.info("No-MSA baseline mode: skipping MSA model loading.")
 
     # ── Read test proteins ─────────────────────────────────────────────────────
     proteins = parse_fasta(args.fasta)
@@ -292,114 +402,182 @@ def run_benchmark(args):
 
     for prot_idx, (prot_name, query_seq) in enumerate(proteins):
         logger.info("=" * 60)
-        logger.info("[%d/%d] %s  L=%d", prot_idx + 1, len(proteins), prot_name, len(query_seq))
+        logger.info("[%d/%d] %s  L=%d  mode=%s",
+                    prot_idx + 1, len(proteins), prot_name, len(query_seq), mode)
 
-        a3m_path = msa_dir / f"{prot_name}.a3m"
-        prot_fold_dir = fold_dir / prot_name
-        prot_fold_dir.mkdir(exist_ok=True)
+        # ── Zero-shot: fold each seed separately, report best pLDDT ───────────
+        if mode == "zeroshot":
+            prot_msa_dir = msa_dir / prot_name
+            prot_msa_dir.mkdir(exist_ok=True)
 
-        # ── Step 1: Generate MSA ───────────────────────────────────────────────
-        if a3m_path.exists() and not args.regenerate:
-            logger.info("  MSA already exists, skipping generation: %s", a3m_path)
-        else:
-            logger.info("  Generating MSA (zero-shot, %d seeds × %d seqs/seed) ...",
-                        args.n_seeds, args.n_seqs)
-            try:
-                gen_seqs = generate_zeroshot(
+            best_plddt = float("nan")
+            best_seed = -1
+            best_cif = None
+
+            for seed, seqs in generate_zeroshot_seeds(
+                query_seq=query_seq,
+                decoder=decoder,
+                latent_fm=latent_fm,
+                esm_model=esm_model,
+                alphabet=alphabet,
+                n_seeds=args.n_seeds,
+                n_seqs_per_seed=args.n_seqs,
+                n_steps=args.n_steps,
+                temperature=args.temperature,
+                device=device,
+            ):
+                seed_a3m = prot_msa_dir / f"seed_{seed}.a3m"
+                if not seed_a3m.exists() or args.regenerate:
+                    write_a3m(query_seq, seqs, str(seed_a3m), prefix=prot_name)
+                    logger.info("  Seed %d: wrote %d seqs to %s", seed, len(seqs), seed_a3m)
+
+                plddt, cif = fold_once(
+                    prot_name=prot_name,
                     query_seq=query_seq,
-                    decoder=decoder,
-                    latent_fm=latent_fm,
-                    esm_model=esm_model,
-                    alphabet=alphabet,
-                    n_seeds=args.n_seeds,
-                    n_seqs_per_seed=args.n_seqs,
-                    n_steps=args.n_steps,
-                    temperature=args.temperature,
-                    device=device,
+                    a3m_path=seed_a3m,
+                    fold_dir=fold_dir,
+                    args=args,
+                    use_msa=True,
+                    tag=f"_seed{seed}",
                 )
-                write_a3m(query_seq, gen_seqs, str(a3m_path), prefix=prot_name)
-                logger.info("  Wrote %d sequences to %s", len(gen_seqs), a3m_path)
-            except Exception as exc:
-                logger.error("  MSA generation failed: %s", exc, exc_info=True)
-                results.append({
-                    "name": prot_name, "seq_len": len(query_seq),
-                    "plddt": float("nan"), "tm_score": float("nan"), "rmsd": float("nan"),
-                    "status": f"msa_error:{exc}",
-                })
-                continue
+                logger.info("  Seed %d pLDDT=%.2f  (best so far=%.2f)",
+                            seed, plddt, best_plddt if not np.isnan(best_plddt) else -1)
 
-        # ── Step 2: Build Protenix JSON ────────────────────────────────────────
-        task = build_protenix_json(
-            name=prot_name,
-            query_seq=query_seq,
-            msa_a3m_path=str(a3m_path) if a3m_path.exists() else None,
-        )
-        json_path = prot_fold_dir / f"{prot_name}_input.json"
-        with open(json_path, "w") as fh:
-            json.dump([task], fh, indent=2)
+                if np.isnan(best_plddt) or plddt > best_plddt:
+                    best_plddt = plddt
+                    best_seed = seed
+                    best_cif = cif
 
-        # ── Step 3: Run Protenix ───────────────────────────────────────────────
-        protenix_out_dir = prot_fold_dir / "protenix_out"
-        protenix_out_dir.mkdir(exist_ok=True)
+            logger.info("  Best seed=%d  pLDDT=%.2f", best_seed, best_plddt)
 
-        pred_cif = find_protenix_output_cif(str(protenix_out_dir), prot_name)
-        if pred_cif and not args.refold:
-            logger.info("  Protenix output already exists, skipping: %s", pred_cif)
-        else:
-            protenix_result = run_protenix(
-                input_json=str(json_path),
-                output_dir=str(protenix_out_dir),
-                model_name=args.protenix_model,
-            )
-            if protenix_result.returncode != 0:
-                logger.error("  Protenix failed (exit %d)", protenix_result.returncode)
-                results.append({
-                    "name": prot_name, "seq_len": len(query_seq),
-                    "plddt": float("nan"), "tm_score": float("nan"), "rmsd": float("nan"),
-                    "status": "protenix_failed",
-                })
-                continue
-            pred_cif = find_protenix_output_cif(str(protenix_out_dir), prot_name)
+            tm_score, rmsd = float("nan"), float("nan")
+            if args.ref_pdb_dir and best_cif:
+                ref_pdb = Path(args.ref_pdb_dir) / f"{prot_name}.pdb"
+                if not ref_pdb.exists():
+                    ref_pdb = Path(args.ref_pdb_dir) / f"{prot_name}.cif"
+                if ref_pdb.exists():
+                    tm_score, rmsd = compute_tmscore(best_cif, str(ref_pdb), args.tmscore_bin)
+                    logger.info("  TM-score=%.4f  RMSD=%.2f Å", tm_score, rmsd)
 
-        if pred_cif is None:
-            logger.error("  Could not find Protenix output CIF for %s", prot_name)
             results.append({
                 "name": prot_name, "seq_len": len(query_seq),
-                "plddt": float("nan"), "tm_score": float("nan"), "rmsd": float("nan"),
-                "status": "cif_not_found",
+                "plddt": best_plddt, "best_seed": best_seed,
+                "tm_score": tm_score, "rmsd": rmsd,
+                "status": "ok" if not np.isnan(best_plddt) else "failed",
             })
-            continue
 
-        # ── Step 4: Extract pLDDT ──────────────────────────────────────────────
-        plddt = extract_plddt_from_cif(pred_cif)
-        logger.info("  pLDDT = %.2f  (from %s)", plddt, Path(pred_cif).name)
+        # ── Few-shot: augment shallow MSA, fold once ───────────────────────────
+        elif mode == "fewshot":
+            # Load shallow MSA for this target
+            shallow_seqs = None
+            if args.shallow_msa_dir:
+                shallow_a3m = Path(args.shallow_msa_dir) / f"{prot_name}.a3m"
+                if shallow_a3m.exists():
+                    shallow_seqs = parse_a3m_seqs(str(shallow_a3m))
+                    logger.info("  Loaded shallow MSA: %d seqs from %s",
+                                len(shallow_seqs), shallow_a3m)
+                else:
+                    logger.warning("  Shallow A3M not found: %s; using depth-1 (query only)",
+                                   shallow_a3m)
 
-        # ── Step 5: TM-score (optional) ────────────────────────────────────────
-        tm_score, rmsd = float("nan"), float("nan")
-        if args.ref_pdb_dir:
-            ref_pdb = Path(args.ref_pdb_dir) / f"{prot_name}.pdb"
-            if not ref_pdb.exists():
-                # Try .cif
-                ref_pdb = Path(args.ref_pdb_dir) / f"{prot_name}.cif"
-            if ref_pdb.exists():
-                tm_score, rmsd = compute_tmscore(pred_cif, str(ref_pdb), args.tmscore_bin)
-                logger.info("  TM-score = %.4f  RMSD = %.2f Å", tm_score, rmsd)
-            else:
-                logger.warning("  Reference structure not found: %s", ref_pdb)
+            if not shallow_seqs:
+                # Depth-1 MSA = query sequence only (ungapped, aligned to itself)
+                shallow_seqs = [query_seq]
+                logger.info("  Using depth-1 shallow MSA (query only)")
 
-        results.append({
-            "name": prot_name,
-            "seq_len": len(query_seq),
-            "plddt": plddt,
-            "tm_score": tm_score,
-            "rmsd": rmsd,
-            "status": "ok",
-        })
+            prot_msa_dir = msa_dir / prot_name
+            prot_msa_dir.mkdir(exist_ok=True)
+            aug_a3m = prot_msa_dir / "augmented.a3m"
+
+            if not aug_a3m.exists() or args.regenerate:
+                try:
+                    aug_seqs = augment_shallow(
+                        shallow_seqs=shallow_seqs,
+                        decoder=decoder,
+                        latent_fm=latent_fm,
+                        protenix_model=protenix_model,   # None → Syn track only
+                        esm_model=esm_model,
+                        alphabet=alphabet,
+                        n_syn_seeds=args.n_seeds,
+                        n_seqs_per_seed=args.n_seqs,
+                        n_rec_seqs=64 if protenix_model else 0,
+                        n_diverse=16,
+                        n_steps=args.n_steps,
+                        temperature=args.temperature,
+                        device=device,
+                    )
+                    write_a3m(query_seq, aug_seqs, str(aug_a3m), prefix=prot_name)
+                    logger.info("  Wrote %d augmented seqs to %s", len(aug_seqs), aug_a3m)
+                except Exception as exc:
+                    logger.error("  Augmentation failed: %s", exc, exc_info=True)
+                    results.append({
+                        "name": prot_name, "seq_len": len(query_seq),
+                        "plddt": float("nan"), "best_seed": -1,
+                        "tm_score": float("nan"), "rmsd": float("nan"),
+                        "status": f"aug_error:{exc}",
+                    })
+                    continue
+
+            plddt, cif = fold_once(
+                prot_name=prot_name,
+                query_seq=query_seq,
+                a3m_path=aug_a3m,
+                fold_dir=fold_dir,
+                args=args,
+                use_msa=True,
+                tag="_fewshot",
+            )
+            logger.info("  pLDDT=%.2f", plddt)
+
+            tm_score, rmsd = float("nan"), float("nan")
+            if args.ref_pdb_dir and cif:
+                ref_pdb = Path(args.ref_pdb_dir) / f"{prot_name}.pdb"
+                if not ref_pdb.exists():
+                    ref_pdb = Path(args.ref_pdb_dir) / f"{prot_name}.cif"
+                if ref_pdb.exists():
+                    tm_score, rmsd = compute_tmscore(cif, str(ref_pdb), args.tmscore_bin)
+                    logger.info("  TM-score=%.4f  RMSD=%.2f Å", tm_score, rmsd)
+
+            results.append({
+                "name": prot_name, "seq_len": len(query_seq),
+                "plddt": plddt, "best_seed": -1,
+                "tm_score": tm_score, "rmsd": rmsd,
+                "status": "ok" if not np.isnan(plddt) else "failed",
+            })
+
+        # ── No-MSA baseline ────────────────────────────────────────────────────
+        elif mode == "nomsa":
+            plddt, cif = fold_once(
+                prot_name=prot_name,
+                query_seq=query_seq,
+                a3m_path=None,
+                fold_dir=fold_dir,
+                args=args,
+                use_msa=False,
+                tag="",
+            )
+            logger.info("  pLDDT=%.2f", plddt)
+
+            tm_score, rmsd = float("nan"), float("nan")
+            if args.ref_pdb_dir and cif:
+                ref_pdb = Path(args.ref_pdb_dir) / f"{prot_name}.pdb"
+                if not ref_pdb.exists():
+                    ref_pdb = Path(args.ref_pdb_dir) / f"{prot_name}.cif"
+                if ref_pdb.exists():
+                    tm_score, rmsd = compute_tmscore(cif, str(ref_pdb), args.tmscore_bin)
+                    logger.info("  TM-score=%.4f  RMSD=%.2f Å", tm_score, rmsd)
+
+            results.append({
+                "name": prot_name, "seq_len": len(query_seq),
+                "plddt": plddt, "best_seed": -1,
+                "tm_score": tm_score, "rmsd": rmsd,
+                "status": "ok" if not np.isnan(plddt) else "failed",
+            })
 
     # ── Write CSV summary ──────────────────────────────────────────────────────
     shard_suffix = f"_shard{args.shard_id}" if args.num_shards > 1 else ""
     csv_path = output_dir / f"shard{shard_suffix}.csv"
-    fieldnames = ["name", "seq_len", "plddt", "tm_score", "rmsd", "status"]
+    fieldnames = ["name", "seq_len", "plddt", "best_seed", "tm_score", "rmsd", "status"]
     with open(csv_path, "w", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=fieldnames)
         writer.writeheader()
@@ -412,7 +590,7 @@ def run_benchmark(args):
     tms = [r["tm_score"] for r in ok if not np.isnan(r["tm_score"])]
 
     print("\n" + "=" * 60)
-    print(f"Fold Benchmark Results  ({len(ok)}/{len(results)} succeeded)")
+    print(f"Fold Benchmark Results  mode={mode}  ({len(ok)}/{len(results)} succeeded)")
     print("=" * 60)
     if plddts:
         print(f"  pLDDT  mean={np.mean(plddts):.2f}  "
@@ -439,29 +617,42 @@ def main():
                         help="Path to latent FM EMA checkpoint")
     parser.add_argument("--output_dir",      required=True,
                         help="Root directory for MSA files, fold outputs, and CSV")
+    parser.add_argument("--mode",            default="zeroshot",
+                        choices=["zeroshot", "fewshot", "nomsa"],
+                        help="Generation mode: zeroshot | fewshot | nomsa (default: zeroshot)")
     parser.add_argument("--ref_pdb_dir",     default=None,
                         help="Directory with reference PDB files named {name}.pdb")
     parser.add_argument("--device",          default="cuda")
     parser.add_argument("--n_seqs",          type=int, default=32,
-                        help="Sequences per seed for zero-shot generation")
+                        help="Sequences per seed")
     parser.add_argument("--n_seeds",         type=int, default=10,
-                        help="Number of latent FM seeds")
+                        help="Number of latent FM seeds (zeroshot: folds each, reports best)")
     parser.add_argument("--n_steps",         type=int, default=100,
                         help="ODE integration steps")
-    parser.add_argument("--temperature",     type=float, default=0.0,
-                        help="SDE temperature (0 = deterministic ODE)")
+    parser.add_argument("--temperature",     type=float, default=0.5,
+                        help="SDE temperature (paper: 0.5)")
     parser.add_argument("--protenix_model",  default="protenix_base_default_v1.0.0",
-                        help="Protenix model name")
+                        help="Protenix model name for structure prediction")
     parser.add_argument("--tmscore_bin",     default="TMscore",
                         help="Path or name of TMscore binary")
-    parser.add_argument("--regenerate",      action="store_true",
-                        help="Re-generate MSAs even if A3M files already exist")
-    parser.add_argument("--refold",          action="store_true",
-                        help="Re-run Protenix even if CIF output already exists")
+    # Few-shot specific
+    parser.add_argument("--shallow_msa_dir", default=None,
+                        help="[fewshot] Directory with shallow A3M files named {target}.a3m")
+    parser.add_argument("--protenix_ckpt",   default=None,
+                        help="[fewshot] Protenix .pt checkpoint for Rec track MSA embedding")
+    # Parallelism
     parser.add_argument("--shard_id",        type=int, default=0,
                         help="0-based shard index for parallel runs (default: 0)")
     parser.add_argument("--num_shards",      type=int, default=1,
                         help="Total number of shards (default: 1 = no sharding)")
+    # Re-run flags
+    parser.add_argument("--regenerate",      action="store_true",
+                        help="Re-generate MSAs even if A3M files already exist")
+    parser.add_argument("--refold",          action="store_true",
+                        help="Re-run Protenix even if CIF output already exists")
+    # Deprecated alias
+    parser.add_argument("--no_msa",          action="store_true",
+                        help="Deprecated: use --mode nomsa instead")
     args = parser.parse_args()
 
     run_benchmark(args)
