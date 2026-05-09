@@ -76,7 +76,7 @@ def parse_a3m(path: str) -> list[str]:
 
 # ── Ref MSA lookup (handles ColabFold assembly1__chain naming) ────────────────
 
-def find_ref_a3m(ref_dir: Path, prot_name: str) -> Path | None:
+def find_ref_a3m(ref_dir: Path, prot_name: str):
     pdb_id = prot_name.split("-")[0]
     for name in [prot_name, pdb_id]:
         p = ref_dir / f"{name}.a3m"
