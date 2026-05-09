@@ -18,7 +18,7 @@ module load cuda/13.0.2
 
 set -euo pipefail
 
-REPO_DIR=${REPO_DIR:-$(cd "$(dirname "$0")/.." && pwd)}
+REPO_DIR=${REPO_DIR:-/home/paul3875/projects/MSA_FLOW}
 DECODER_CKPT=${DECODER_CKPT:-/gpfs/deepfold/users/yjlee4/decoder/latest.pt}
 LATENT_FM_CKPT=${LATENT_FM_CKPT:-$REPO_DIR/runs/latent_fm/latent_fm_ema_final.pt}
 PROTENIX_MODEL=${PROTENIX_MODEL:-protenix_base_default_v1.0.0}
