@@ -93,12 +93,19 @@ def load_protenix(checkpoint_path: str, device: torch.device):
         if d not in sys.path:
             sys.path.insert(0, d)
 
+    import logging as _log
+    _logger = _log.getLogger(__name__)
+
+    _logger.info("[load_protenix] importing Protenix...")
     from protenix.model.protenix import Protenix
+    _logger.info("[load_protenix] importing parse_configs...")
     from protenix.config.config import parse_configs
+    _logger.info("[load_protenix] importing configs...")
     from configs.configs_base import configs as configs_base
     from configs.configs_data import data_configs
     from configs.configs_inference import inference_configs
     from configs.configs_model_type import model_configs
+    _logger.info("[load_protenix] configs imported")
 
     def _deep_update(d: dict, u: dict) -> dict:
         for k, v in u.items():
@@ -108,20 +115,28 @@ def load_protenix(checkpoint_path: str, device: torch.device):
                 d[k] = v
         return d
 
-    model_name = Path(checkpoint_path).stem   # e.g. protenix_base_default_v1.0.0
+    model_name = Path(checkpoint_path).stem
     base = {**configs_base, **{"data": data_configs}, **inference_configs}
     if model_name in model_configs:
         _deep_update(base, model_configs[model_name])
 
+    _logger.info("[load_protenix] calling parse_configs...")
     cfg = parse_configs(
         configs=base,
         arg_str="--trimul_kernel torch --triatt_kernel torch --enable_fusion False",
         fill_required_with_null=True,
     )
-
-    model = Protenix(cfg).eval().to(device)
+    _logger.info("[load_protenix] instantiating Protenix(cfg)...")
+    model = Protenix(cfg)
+    _logger.info("[load_protenix] .eval()...")
+    model = model.eval()
+    _logger.info("[load_protenix] .to(device)...")
+    model = model.to(device)
+    _logger.info("[load_protenix] torch.load checkpoint...")
     state = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    _logger.info("[load_protenix] load_state_dict...")
     model.load_state_dict(state.get("model", state), strict=False)
+    _logger.info("[load_protenix] done")
     return model
 
 
