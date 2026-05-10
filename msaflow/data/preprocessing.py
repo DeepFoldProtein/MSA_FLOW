@@ -242,7 +242,7 @@ def _build_protenix_msa_input(seqs: list[str], device: torch.device) -> dict:
     L = len(seqs[0])
     msa_arr = np.zeros((N, L), dtype=np.int64)
     for i, seq in enumerate(seqs):
-        for j, aa in enumerate(seq):
+        for j, aa in enumerate(seq[:L]):
             msa_arr[i, j] = af3_res_to_idx.get(aa.upper(), unk_idx)
 
     msa_t = torch.from_numpy(msa_arr).unsqueeze(0).to(device)   # (1, N, L)
