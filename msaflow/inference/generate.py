@@ -113,7 +113,11 @@ def load_protenix(checkpoint_path: str, device: torch.device):
     if model_name in model_configs:
         _deep_update(base, model_configs[model_name])
 
-    cfg = parse_configs(configs=base, arg_str=None, fill_required_with_null=True)
+    cfg = parse_configs(
+        configs=base,
+        arg_str="--trimul_kernel torch --triatt_kernel torch --enable_fusion False",
+        fill_required_with_null=True,
+    )
 
     model = Protenix(cfg).eval().to(device)
     state = torch.load(checkpoint_path, map_location=device, weights_only=False)
